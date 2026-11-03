@@ -163,7 +163,10 @@
 //! looked for as `nsh test` resolves selectors: in the newest modal (and
 //! what it holds) first, then in the rest in tree order. Of a navigation
 //! stack only the top screen is on screen: the screens it covers and what
-//! they hold are not, for any step. A hidden view (`visibility: hidden`, as
+//! they hold are not (`expect` and `absent` never read their texts, a
+//! user's steps never reach them), and the steps that read a view take one
+//! in a covered screen only when no view on screen or hidden matches (the
+//! options of screens pushed together). A hidden view (`visibility: hidden`, as
 //! the cells a list keeps for reuse with their last row) and what it holds
 //! are not on screen: `expect` and `absent` never read their texts, and
 //! the steps a user takes (`tap`, `touch`, `type`, `key`, `scroll`,
@@ -317,6 +320,17 @@ enum Back {
     },
     /// Nothing to go back from.
     Nothing,
+}
+
+/// Which views a selector looks among.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The views on screen ([`Views::shown`]).
+    Shown,
+    /// Those and the hidden ones ([`Views::attached`]).
+    Attached,
+    /// Those and the ones in the screens stacks cover ([`Views::all`]).
+    All,
 }
 
 #[derive(Default)]
@@ -577,6 +591,23 @@ impl Views {
         self.walk(false)
     }
 
+    /// Every view below the root in tree order, the screens a stack covers
+    /// and hidden views included: what a step that reads a view falls back
+    /// to last.
+    fn all(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![ROOT];
+        while let Some(id) = stack.pop() {
+            if id != ROOT {
+                out.push(id);
+            }
+            if let Some(children) = self.children.get(&id) {
+                stack.extend(children.iter().rev());
+            }
+        }
+        out
+    }
+
     /// The views below the root in tree order, of a navigation stack only
     /// its top screen (the others are covered, as `nsh test` sees them),
     /// without the screens and modals a back took away; without `hidden`,
@@ -683,40 +714,42 @@ impl Views {
     }
 
     /// The first view on screen `selector` names, or, when none on screen
-    /// does, the first hidden one (`visibility: hidden`), so a step can
-    /// read what a hidden view itself was given: a view on screen comes
-    /// first, a list's spare cell never stands in for it.
+    /// does, the first hidden one (`visibility: hidden`), else the first in
+    /// a screen a stack covers, so a step can read what such a view itself
+    /// was given (a covered screen's options): a view on screen comes
+    /// first, a list's spare cell or a covered screen's view never stands
+    /// in for it.
     fn find_view(&self, selector: &str) -> Option<NodeId> {
-        self.select(selector, false)
-            .or_else(|| self.select(selector, true))
+        self.select(selector, Reach::Shown)
+            .or_else(|| self.select(selector, Reach::Attached))
+            .or_else(|| self.select(selector, Reach::All))
     }
 
-    /// The first view on screen `selector` names, never a hidden one: what
-    /// the user's taps, touches, typing and scrolls reach.
+    /// The first view on screen `selector` names, never a hidden or covered
+    /// one: what the user's taps, touches, typing and scrolls reach.
     fn find_shown(&self, selector: &str) -> Option<NodeId> {
-        self.select(selector, false)
+        self.select(selector, Reach::Shown)
     }
 
-    /// The first view `selector` names; without `hidden`, only one on
-    /// screen.
-    fn select(&self, selector: &str, hidden: bool) -> Option<NodeId> {
-        let found = self.select_in(selector, hidden)?;
+    /// The first view among those `reach` takes that `selector` names.
+    fn select(&self, selector: &str, reach: Reach) -> Option<NodeId> {
+        let found = self.select_in(selector, reach)?;
         // The root is the platform's: it always shows.
-        (hidden || found == ROOT || self.shown().contains(&found)).then_some(found)
+        (reach != Reach::Shown || found == ROOT || self.shown().contains(&found)).then_some(found)
     }
 
-    fn select_in(&self, selector: &str, hidden: bool) -> Option<NodeId> {
+    fn select_in(&self, selector: &str, reach: Reach) -> Option<NodeId> {
         if let Some(inner) = selector.strip_prefix("scroll:") {
-            return self.scroll_around(inner, hidden);
+            return self.scroll_around(inner, reach);
         }
         // The view around another: a component's own part (a popup) that
         // only the app's content in it names.
         if let Some(inner) = selector.strip_prefix("parent:") {
-            return self.nodes.get(&self.select_in(inner, hidden)?)?.parent;
+            return self.nodes.get(&self.select_in(inner, reach)?)?.parent;
         }
         // The view below another among its siblings (a popup's backdrop).
         if let Some(inner) = selector.strip_prefix("below:") {
-            let id = self.select_in(inner, hidden)?;
+            let id = self.select_in(inner, reach)?;
             let siblings = self.children.get(&self.nodes.get(&id)?.parent?)?;
             let at = siblings.iter().position(|&s| s == id)?;
             return at.checked_sub(1).map(|i| siblings[i]);
@@ -733,10 +766,10 @@ impl Views {
         } else {
             panic!("selector `{selector}`: expected id:, label:, text: or span:")
         };
-        let views = if hidden {
-            self.attached()
-        } else {
-            self.shown()
+        let views = match reach {
+            Reach::Shown => self.shown(),
+            Reach::Attached => self.attached(),
+            Reach::All => self.all(),
         };
         self.by_layer(views)
             .into_iter()
@@ -744,10 +777,10 @@ impl Views {
     }
 
     /// The nearest scroll view around the first view `selector` names (a
-    /// list has no `testID` of its own: its rows name it); without
-    /// `hidden`, of those on screen.
-    fn scroll_around(&self, selector: &str, hidden: bool) -> Option<NodeId> {
-        let mut id = self.select_in(selector, hidden)?;
+    /// list has no `testID` of its own: its rows name it), among those
+    /// `reach` takes.
+    fn scroll_around(&self, selector: &str, reach: Reach) -> Option<NodeId> {
+        let mut id = self.select_in(selector, reach)?;
         loop {
             id = self.nodes.get(&id)?.parent?;
             if self.nodes.get(&id)?.mounted.is_scroll() {
@@ -2423,13 +2456,17 @@ mod tests {
                 test_id(14, "go"),
             ],
         });
-        // The pushed screen covers the first: neither a user's steps nor
-        // those that read a view reach what it covers.
+        // The pushed screen covers the first: a user's steps do not reach
+        // what it covers.
         assert_eq!(views.texts(), ["Details"]);
         assert!(!views.shows("Home"));
         assert_eq!(views.find("id:go"), Some(14));
         assert_eq!(views.find("text:Home"), None);
-        assert_eq!(views.find_view("text:Home"), None);
+        assert_eq!(views.find_shown("text:Home"), None);
+        // A step that reads a view still reaches a covered screen's, when
+        // nothing on screen matches.
+        assert_eq!(views.find_view("text:Home"), Some(6));
+        assert_eq!(views.find_view("id:go"), Some(14));
 
         // A modal after the stack: its button comes first, though the
         // stack's is before it in the tree.
