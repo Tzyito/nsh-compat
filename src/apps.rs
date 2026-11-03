@@ -128,7 +128,12 @@
 //! app's content in it, and `below:<selector>`, its sibling below it: a
 //! popup's backdrop);
 //! the steps after `frame` also take the part after `:` quoted, for one
-//! with spaces: `text:"Taps: 0"`. Any error the app reports fails it. `NSH_COMPAT_APP=<name>` runs the apps whose name starts so; `NSH_COMPAT_DUMP=1` prints the texts
+//! with spaces: `text:"Taps: 0"`. A hidden view (`visibility: hidden`, as
+//! the cells a list keeps for reuse with their last row) and what it holds
+//! are not on screen: `expect` and `absent` never read their texts, and
+//! the steps a user takes (`tap`, `touch`, `type`, `key`, `scroll`,
+//! `state`) never reach them; the other steps, which read a view, take a
+//! hidden one only when no view on screen matches. Any error the app reports fails it. `NSH_COMPAT_APP=<name>` runs the apps whose name starts so; `NSH_COMPAT_DUMP=1` prints the texts
 //! on screen after each step, for writing scripts.
 
 use std::{
@@ -324,12 +329,29 @@ impl Views {
         }
     }
 
-    /// The views on screen (attached below the root), in tree order.
+    /// The views attached below the root, in tree order.
     fn attached(&self) -> Vec<NodeId> {
+        self.walk(true)
+    }
+
+    /// The views on screen: those attached below the root that neither
+    /// they nor a view around them hide (`visibility: hidden`: a list
+    /// keeps the cells it does not use, with their last row, hidden for
+    /// reuse), in tree order, as `nsh test` finds them.
+    fn shown(&self) -> Vec<NodeId> {
+        self.walk(false)
+    }
+
+    /// The views below the root in tree order; without `hidden`, a hidden
+    /// view and what it holds are left out.
+    fn walk(&self, hidden: bool) -> Vec<NodeId> {
         let mut out = Vec::new();
         let mut stack = vec![ROOT];
         while let Some(id) = stack.pop() {
             if id != ROOT {
+                if !hidden && self.nodes.get(&id).is_some_and(|v| v.mounted.hidden()) {
+                    continue;
+                }
                 out.push(id);
             }
             if let Some(children) = self.children.get(&id) {
@@ -343,7 +365,7 @@ impl Views {
     /// gives a view out of the layout, `display: none` on it or around it,
     /// a frame of 0 × 0, as a `keepMounted` panel's content while closed).
     fn texts(&self) -> Vec<String> {
-        self.attached()
+        self.shown()
             .iter()
             .filter_map(|id| {
                 let view = self.nodes.get(id)?;
@@ -363,15 +385,15 @@ impl Views {
     /// The first view on screen `selector` names, or its nearest pressable
     /// ancestor.
     fn find(&self, selector: &str) -> Option<NodeId> {
-        self.find_view(selector)
+        self.find_shown(selector)
             .and_then(|id| self.pressable_from(id))
     }
 
     /// For `span:<text>`, the innermost pressable span where `<text>`
-    /// starts in the first text that contains it.
+    /// starts in the first text on screen that contains it.
     fn link(&self, selector: &str) -> Option<NodeId> {
         let want = selector.strip_prefix("span:")?;
-        let view = self.nodes.get(&self.find_view(selector)?)?;
+        let view = self.nodes.get(&self.find_shown(selector)?)?;
         let text = view.text.as_deref()?;
         let at = text[..text.find(want)?].encode_utf16().count() as u32;
         view.links
@@ -381,19 +403,41 @@ impl Views {
             .map(|l| l.node)
     }
 
-    /// The first view on screen `selector` names.
+    /// The first view on screen `selector` names, or, when none on screen
+    /// does, the first hidden one (`visibility: hidden`), so a step can
+    /// read what a hidden view itself was given: a view on screen comes
+    /// first, a list's spare cell never stands in for it.
     fn find_view(&self, selector: &str) -> Option<NodeId> {
+        self.select(selector, false)
+            .or_else(|| self.select(selector, true))
+    }
+
+    /// The first view on screen `selector` names, never a hidden one: what
+    /// the user's taps, touches, typing and scrolls reach.
+    fn find_shown(&self, selector: &str) -> Option<NodeId> {
+        self.select(selector, false)
+    }
+
+    /// The first view `selector` names; without `hidden`, only one on
+    /// screen.
+    fn select(&self, selector: &str, hidden: bool) -> Option<NodeId> {
+        let found = self.select_in(selector, hidden)?;
+        // The root is the platform's: it always shows.
+        (hidden || found == ROOT || self.shown().contains(&found)).then_some(found)
+    }
+
+    fn select_in(&self, selector: &str, hidden: bool) -> Option<NodeId> {
         if let Some(inner) = selector.strip_prefix("scroll:") {
-            return self.scroll_around(inner);
+            return self.scroll_around(inner, hidden);
         }
         // The view around another: a component's own part (a popup) that
         // only the app's content in it names.
         if let Some(inner) = selector.strip_prefix("parent:") {
-            return self.nodes.get(&self.find_view(inner)?)?.parent;
+            return self.nodes.get(&self.select_in(inner, hidden)?)?.parent;
         }
         // The view below another among its siblings (a popup's backdrop).
         if let Some(inner) = selector.strip_prefix("below:") {
-            let id = self.find_view(inner)?;
+            let id = self.select_in(inner, hidden)?;
             let siblings = self.children.get(&self.nodes.get(&id)?.parent?)?;
             let at = siblings.iter().position(|&s| s == id)?;
             return at.checked_sub(1).map(|i| siblings[i]);
@@ -410,15 +454,21 @@ impl Views {
         } else {
             panic!("selector `{selector}`: expected id:, label:, text: or span:")
         };
-        self.attached()
+        let views = if hidden {
+            self.attached()
+        } else {
+            self.shown()
+        };
+        views
             .into_iter()
             .find(|id| self.nodes.get(id).is_some_and(&test))
     }
 
-    /// The nearest scroll view around the first view on screen `selector`
-    /// names (a list has no `testID` of its own: its rows name it).
-    fn scroll_around(&self, selector: &str) -> Option<NodeId> {
-        let mut id = self.find_view(selector)?;
+    /// The nearest scroll view around the first view `selector` names (a
+    /// list has no `testID` of its own: its rows name it); without
+    /// `hidden`, of those on screen.
+    fn scroll_around(&self, selector: &str, hidden: bool) -> Option<NodeId> {
+        let mut id = self.select_in(selector, hidden)?;
         loop {
             id = self.nodes.get(&id)?.parent?;
             if self.nodes.get(&id)?.mounted.is_scroll() {
@@ -1052,7 +1102,7 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                             let at = numbers::<2>(at).ok_or_else(|| {
                                 format!("`{line}`: touch start <selector> <x> <y>")
                             })?;
-                            let Some(target) = run.views.find_view(&selector) else {
+                            let Some(target) = run.views.find_shown(&selector) else {
                                 return failed("no such view".into(), &run);
                             };
                             let path = touch_path(&run.views, target);
@@ -1093,7 +1143,7 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                 "type" | "key" => {
                     let (selector, text) = selector(arg);
                     run.settle(TAP_WAIT);
-                    let Some(id) = run.views.find_view(&selector) else {
+                    let Some(id) = run.views.find_shown(&selector) else {
                         return failed("no such view".into(), &run);
                     };
                     let key = |key: &str| {
@@ -1144,7 +1194,7 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                     let [x, y] = numbers::<2>(at)
                         .ok_or_else(|| format!("`{line}`: scroll <selector> <x> <y>"))?;
                     run.settle(TAP_WAIT);
-                    let Some(id) = run.views.find_view(&selector) else {
+                    let Some(id) = run.views.find_shown(&selector) else {
                         return failed("no such view".into(), &run);
                     };
                     run.control.scroll(id, point(px(x), px(y)), 0);
@@ -1188,7 +1238,7 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                         };
                     }
                     let tracks = |v: &Views| {
-                        v.find_view(&selector)
+                        v.find_shown(&selector)
                             .filter(|id| v.nodes.get(id).is_some_and(|n| n.mounted.tracks(states)))
                     };
                     if !run.until(EXPECT_WAIT, |v| tracks(v).is_some()) {
@@ -1649,4 +1699,120 @@ fn numbers<const N: usize>(text: &str) -> Option<[f32; N]> {
         .map(|w| w.parse().ok())
         .collect::<Option<_>>()?;
     parsed.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use nsh_core::{AttributedText, EventMask, ViewKind, ViewProps, ViewStyle};
+
+    use super::*;
+
+    fn create(id: NodeId, kind: ViewKind) -> MountItem {
+        MountItem::Create { id, kind }
+    }
+
+    fn insert(parent: NodeId, child: NodeId) -> MountItem {
+        MountItem::Insert {
+            parent,
+            child,
+            before: None,
+        }
+    }
+
+    fn text(id: NodeId, value: &str) -> MountItem {
+        MountItem::Text {
+            id,
+            text: Arc::new(AttributedText {
+                text: value.into(),
+                ..Default::default()
+            }),
+            layout: nsh_core::TextLayout(Arc::new(())),
+            content: Default::default(),
+        }
+    }
+
+    fn hidden(id: NodeId, hidden: bool) -> MountItem {
+        let mut style = ViewStyle::default();
+        style.hidden = hidden;
+        MountItem::ViewStyle {
+            id,
+            style: Box::new(style),
+        }
+    }
+
+    fn test_id(id: NodeId, value: &str) -> MountItem {
+        let mut props = ViewProps::default();
+        props.test_id = Some(value.into());
+        MountItem::ViewProps {
+            id,
+            props: Box::new(props),
+        }
+    }
+
+    fn pressable(id: NodeId) -> MountItem {
+        let mut events = EventMask::default();
+        events.set(EventKind::Press, true);
+        MountItem::Events { id, events }
+    }
+
+    /// A list of two cells, the first a spare one a list hid for reuse
+    /// with its last row, `Row 7`, which the second, on screen, shows too.
+    fn list() -> Views {
+        let mut views = Views::default();
+        views.apply(&MountBatch {
+            items: vec![
+                create(2, ViewKind::Scroll),
+                create(4, ViewKind::View),
+                create(6, ViewKind::Text),
+                create(8, ViewKind::View),
+                create(10, ViewKind::Text),
+                insert(ROOT, 2),
+                insert(2, 4),
+                insert(4, 6),
+                insert(2, 8),
+                insert(8, 10),
+                pressable(4),
+                pressable(8),
+                test_id(4, "row"),
+                test_id(8, "row"),
+                text(6, "Row 7"),
+                text(10, "Row 7"),
+                hidden(4, true),
+            ],
+        });
+        views
+    }
+
+    #[test]
+    fn hidden_views_and_what_they_hold_are_not_on_screen() {
+        let mut views = list();
+        assert_eq!(views.texts(), ["Row 7"]);
+        assert_eq!(views.shown(), [2, 8, 10]);
+        assert_eq!(views.attached(), [2, 4, 6, 8, 10]);
+        // The view on screen is found, never the spare cell before it.
+        assert_eq!(views.find("text:Row 7"), Some(8));
+        assert_eq!(views.find_view("id:row"), Some(8));
+        assert_eq!(views.find_shown("parent:text:Row 7"), Some(8));
+        assert_eq!(views.find_shown("scroll:text:Row 7"), Some(2));
+
+        // The cell on screen hides too: its row is gone from the screen,
+        // and a user's steps reach neither cell.
+        views.apply(&MountBatch {
+            items: vec![hidden(8, true)],
+        });
+        assert!(views.texts().is_empty());
+        assert!(!views.shows("Row 7"));
+        assert_eq!(views.find("text:Row 7"), None);
+        assert_eq!(views.find_shown("id:row"), None);
+        assert_eq!(views.find_shown("below:id:row"), None);
+        // A step that reads a view still finds a hidden one.
+        assert_eq!(views.find_view("id:row"), Some(4));
+
+        // The first cell is used again: it shows its new row.
+        views.apply(&MountBatch {
+            items: vec![hidden(4, false), text(6, "Row 1")],
+        });
+        assert_eq!(views.texts(), ["Row 1"]);
+        assert_eq!(views.find("text:Row 1"), Some(4));
+    }
 }

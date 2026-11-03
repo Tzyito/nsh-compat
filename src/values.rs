@@ -1285,6 +1285,12 @@ impl Mounted {
         self.kind == Some(ViewKind::Scroll)
     }
 
+    /// Whether neither the view nor what it holds shows
+    /// (`visibility: hidden`, as a list's spare cells are).
+    pub(crate) fn hidden(&self) -> bool {
+        self.style.as_ref().is_some_and(|s| s.hidden)
+    }
+
     /// The status bar the platform was last told to show (on the root):
     /// `foreground` (`auto`, `light`, `dark`, as `StatusBarForeground`
     /// names them), `hidden` and `animated`, each always written; `None`
