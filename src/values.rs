@@ -1285,6 +1285,22 @@ impl Mounted {
         self.kind == Some(ViewKind::Scroll)
     }
 
+    /// The kind of view it was created as.
+    pub(crate) fn kind(&self) -> Option<ViewKind> {
+        self.kind
+    }
+
+    /// A screen that asks before going back (`ScreenConfig::prevent_back`).
+    pub(crate) fn prevent_back(&self) -> bool {
+        self.screen.as_ref().is_some_and(|s| s.prevent_back)
+    }
+
+    /// A modal the user's back closes natively
+    /// (`ModalConfig::close_on_escape`), once the platform was told so.
+    pub(crate) fn close_on_escape(&self) -> bool {
+        self.modal.as_ref().is_some_and(|m| m.close_on_escape)
+    }
+
     /// Whether the view is a text input.
     pub(crate) fn is_input(&self) -> bool {
         self.kind == Some(ViewKind::Input)

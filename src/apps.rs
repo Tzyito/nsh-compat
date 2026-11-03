@@ -101,10 +101,24 @@
 //!   on every platform: the newest binding of the app's keymap
 //!   (`keymap.bind`, and the keys a focused control binds: a tree's or a
 //!   carousel's arrows) that fires where the focus is hears it
-//!   (`onKeyCommand`); a key no binding takes reaches nothing. A control
+//!   (`onKeyCommand`); Escape that no binding takes goes back as `back`
+//!   does when there is something to go back from and no input has the
+//!   focus; another key no binding takes reaches nothing. A control
 //!   is focused by `event <selector> onFocus`, as the platform reports it;
 //!   while an input has the focus (the app's `focus()`, or an `onFocus`
 //!   step), only the bindings that fire while editing do;
+//! - `back`: goes back as the user does (a header's back button, the back
+//!   key; `nsh test`'s `back`): when the root listens to `onBackPress`
+//!   (the core's overlays, `BackHandler`) and the back would not close a
+//!   modal, it hears it; else in the newest modal (or the whole screen)
+//!   the innermost stack that can go back tells its top screen
+//!   (`onBackRequest`, when it listens) and pops it (`onDismiss`), or only
+//!   tells it when it prevents going back (`preventBack`); without one, the
+//!   newest modal gets `onRequestClose` (`reason` `cancel`) and closes
+//!   (`onDismiss`) when `closeOnEscape`. A screen popped or a modal closed
+//!   this way is gone until the app removes it. It fails when there is
+//!   nothing to go back from. A back the app asks for (a back press no
+//!   listener took) goes back so without asking, after any step;
 //! - `scroll <selector> <x> <y>`: the scroll view the selector names
 //!   scrolled to content offset `<x> <y>` (`onScroll` then reports it,
 //!   with the sizes the core knows, and its `contentOffset` reads it) and
@@ -154,7 +168,7 @@
 //! on screen after each step, for writing scripts.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, LazyLock, Mutex, OnceLock,
@@ -168,9 +182,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use nsh_core::{
     ApproxTextEngine, Command, ContextMenuEvent, EventKind, EventPayload, MountBatch, MountItem,
     MouseButton, MouseEvent, NodeId, PayloadValue, Points, PressEvent, Size, TextLink, TouchEvent,
-    TouchPhase, TouchPoint,
+    TouchPhase, TouchPoint, ViewKind,
     geometry::{DevicePixels, point, px},
-    keymap::{KeyMatch, Keymap, Keystroke, Modifiers},
+    keymap::{Key, KeyMatch, Keymap, Keystroke, Modifiers},
     platform::{Environment, Idiom, Os},
     tailwind::state,
 };
@@ -276,6 +290,29 @@ struct Views {
     /// The view with the keyboard focus: an input the app focused, or a
     /// view an `event` step reported focused.
     focus: Option<NodeId>,
+    /// Screens a back popped natively, until the app removes them.
+    popped: HashSet<NodeId>,
+    /// Modals a back closed natively, until the app removes them.
+    closed: HashSet<NodeId>,
+    /// The app asked for a back (`Command::Back`: a back press no listener
+    /// took), which the run carries out.
+    back_asked: bool,
+}
+
+/// What a back does ([`Views::back_target`]), as `nsh test` decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Back {
+    /// The stack pops this screen.
+    Pop(NodeId),
+    /// This screen prevents going back (`preventBack`): it is asked.
+    Ask(NodeId),
+    /// The modal asks to close, and closes when the user may close it.
+    Close {
+        modal: NodeId,
+        close_on_escape: bool,
+    },
+    /// Nothing to go back from.
+    Nothing,
 }
 
 #[derive(Default)]
@@ -312,11 +349,17 @@ impl Views {
                     siblings.insert(at, *child);
                     self.nodes.entry(*child).or_default().parent = Some(*parent);
                 }
-                MountItem::Remove { id } => self.detach(*id),
+                MountItem::Remove { id } => {
+                    self.detach(*id);
+                    self.popped.remove(id);
+                    self.closed.remove(id);
+                }
                 MountItem::Delete { id } => {
                     self.detach(*id);
                     self.nodes.remove(id);
                     self.children.remove(id);
+                    self.popped.remove(id);
+                    self.closed.remove(id);
                     if self.focus == Some(*id) {
                         self.focus = None;
                     }
@@ -332,6 +375,10 @@ impl Views {
                     id,
                     command: Command::Blur,
                 } if *id == ROOT || self.focus == Some(*id) => self.focus = None,
+                MountItem::Command {
+                    command: Command::Back,
+                    ..
+                } => self.back_asked = true,
                 MountItem::Events { id, events } => {
                     self.nodes.entry(*id).or_default().pressable =
                         events.contains(EventKind::Press);
@@ -385,12 +432,131 @@ impl Views {
     /// where the focus is (while an input on screen has it, only those
     /// that fire while editing).
     fn key_match(&self, keystroke: Keystroke) -> KeyMatch {
-        let editing = self
-            .focus
-            .is_some_and(|id| self.is_input(id) && self.shown().contains(&id));
         self.keymap
             .as_ref()
-            .map_or(KeyMatch::None, |k| k.find(keystroke, editing, false))
+            .map_or(KeyMatch::None, |k| k.find(keystroke, self.editing(), false))
+    }
+
+    /// Whether an input on screen has the focus.
+    fn editing(&self) -> bool {
+        self.focus
+            .is_some_and(|id| self.is_input(id) && self.shown().contains(&id))
+    }
+
+    /// Whether view `id` reports `event`.
+    fn hears(&self, id: NodeId, event: EventKind) -> bool {
+        self.nodes
+            .get(&id)
+            .is_some_and(|v| v.mounted.listens(event))
+    }
+
+    /// The screens stack `id` shows, bottom to top (without those a back
+    /// popped).
+    fn screens(&self, id: NodeId) -> Vec<NodeId> {
+        self.children
+            .get(&id)
+            .map(|c| {
+                c.iter()
+                    .copied()
+                    .filter(|s| !self.popped.contains(s))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What going back does now, as a platform's back does it (`nsh
+    /// test`'s): in the newest modal (else the whole screen) the innermost
+    /// stack that can go back pops its top screen, or asks it when it
+    /// prevents going back; without one, the newest modal asks to close.
+    fn back_target(&self) -> Back {
+        let attached = self.attached();
+        let modal = attached
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| self.kind(*id) == Some(ViewKind::Modal));
+        let prevents = |id: NodeId| {
+            self.nodes
+                .get(&id)
+                .is_some_and(|v| v.mounted.prevent_back())
+        };
+        let can_go_back = |stack: NodeId| {
+            let screens = self.screens(stack);
+            screens.len() >= 2 || screens.last().is_some_and(|s| prevents(*s))
+        };
+        let stacks: Vec<NodeId> = attached
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.kind(*id) == Some(ViewKind::Stack)
+                    && modal.is_none_or(|m| self.is_inside(*id, m))
+                    && can_go_back(*id)
+            })
+            .collect();
+        let innermost = stacks
+            .iter()
+            .copied()
+            .find(|s| !stacks.iter().any(|o| o != s && self.is_inside(*o, *s)));
+        if let Some(stack) = innermost
+            && let Some(&top) = self.screens(stack).last()
+        {
+            return if prevents(top) {
+                Back::Ask(top)
+            } else {
+                Back::Pop(top)
+            };
+        }
+        match modal {
+            Some(modal) => Back::Close {
+                modal,
+                close_on_escape: self
+                    .nodes
+                    .get(&modal)
+                    .is_some_and(|v| v.mounted.close_on_escape()),
+            },
+            None => Back::Nothing,
+        }
+    }
+
+    /// Goes back as a platform does (`nsh test`'s `back`): the events it
+    /// reports, in order, with the screen it pops or the modal it closes
+    /// taken off natively; `None` when nothing could go back. `ask`: the
+    /// root's back listener hears it first, outside modals (the overlays'
+    /// `onCancel`, `BackHandler`; what none takes comes back as the app's
+    /// `Command::Back`, which goes back without asking).
+    fn back(&mut self, ask: bool) -> Option<Vec<(NodeId, EventKind, EventPayload)>> {
+        let target = self.back_target();
+        if ask && !matches!(target, Back::Close { .. }) && self.hears(ROOT, EventKind::BackPress) {
+            return Some(vec![(ROOT, EventKind::BackPress, EventPayload::None)]);
+        }
+        let mut events = Vec::new();
+        match target {
+            Back::Pop(screen) => {
+                // Platforms tell a page that listens of every back press.
+                if self.hears(screen, EventKind::BackRequest) {
+                    events.push((screen, EventKind::BackRequest, EventPayload::None));
+                }
+                self.popped.insert(screen);
+                events.push((screen, EventKind::Dismiss, EventPayload::None));
+            }
+            Back::Ask(screen) => {
+                events.push((screen, EventKind::BackRequest, EventPayload::None));
+            }
+            Back::Close {
+                modal,
+                close_on_escape,
+            } => {
+                let reason =
+                    EventPayload::Map(vec![("reason", PayloadValue::Str("cancel".into()))]);
+                events.push((modal, EventKind::RequestClose, reason));
+                if close_on_escape {
+                    self.closed.insert(modal);
+                    events.push((modal, EventKind::Dismiss, EventPayload::None));
+                }
+            }
+            Back::Nothing => return None,
+        }
+        Some(events)
     }
 
     /// The views attached below the root, in tree order.
@@ -406,12 +572,16 @@ impl Views {
         self.walk(false)
     }
 
-    /// The views below the root in tree order; without `hidden`, a hidden
-    /// view and what it holds are left out.
+    /// The views below the root in tree order, without the screens and
+    /// modals a back took away; without `hidden`, a hidden view and what it
+    /// holds are left out.
     fn walk(&self, hidden: bool) -> Vec<NodeId> {
         let mut out = Vec::new();
         let mut stack = vec![ROOT];
         while let Some(id) = stack.pop() {
+            if self.closed.contains(&id) {
+                continue;
+            }
             if id != ROOT {
                 if !hidden && self.nodes.get(&id).is_some_and(|v| v.mounted.hidden()) {
                     continue;
@@ -419,10 +589,27 @@ impl Views {
                 out.push(id);
             }
             if let Some(children) = self.children.get(&id) {
-                stack.extend(children.iter().rev());
+                stack.extend(children.iter().rev().filter(|c| !self.popped.contains(c)));
             }
         }
         out
+    }
+
+    fn kind(&self, id: NodeId) -> Option<ViewKind> {
+        self.nodes.get(&id)?.mounted.kind()
+    }
+
+    /// Whether `id` is `ancestor` or inside it.
+    fn is_inside(&self, mut id: NodeId, ancestor: NodeId) -> bool {
+        loop {
+            if id == ancestor {
+                return true;
+            }
+            match self.nodes.get(&id).and_then(|v| v.parent) {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
     }
 
     /// The texts on screen: a text laid out to no size is not (the core
@@ -677,6 +864,27 @@ impl Run {
         }
     }
 
+    /// Applies `batch`, and goes back when the app asked (a back press no
+    /// listener took), as the platforms do.
+    fn apply(&mut self, batch: &MountBatch) {
+        self.views.apply(batch);
+        if std::mem::take(&mut self.views.back_asked) {
+            self.go_back(false);
+        }
+    }
+
+    /// Goes back as a platform does ([`Views::back`]); false when nothing
+    /// could.
+    fn go_back(&mut self, ask: bool) -> bool {
+        let Some(events) = self.views.back(ask) else {
+            return false;
+        };
+        for (id, kind, payload) in events {
+            self.control.dispatch_event(id, kind, payload);
+        }
+        true
+    }
+
     /// Whether the app printed a line containing `text`.
     fn printed(&self, text: &str) -> bool {
         self.thread
@@ -696,7 +904,7 @@ impl Run {
                 return false;
             }
             match self.rx.recv_timeout(left.min(FRAME)) {
-                Ok(batch) => self.views.apply(&batch),
+                Ok(batch) => self.apply(&batch),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => panic!("the engine stopped"),
             }
@@ -715,7 +923,7 @@ impl Run {
             // A frame at a time: an animation that ends may be what makes
             // the app change.
             match self.rx.recv_timeout(left.min(FRAME)) {
-                Ok(batch) => self.views.apply(&batch),
+                Ok(batch) => self.apply(&batch),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => panic!("the engine stopped"),
             }
@@ -736,7 +944,7 @@ impl Run {
             let left = (end - now).min(QUIET - (now - last));
             match self.rx.recv_timeout(left.min(FRAME)) {
                 Ok(batch) => {
-                    self.views.apply(&batch);
+                    self.apply(&batch);
                     last = Instant::now();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1230,12 +1438,33 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                     let stroke = Keystroke::parse(keys, os)
                         .map_err(|e| format!("`{line}`: key <keys>: {e}"))?;
                     run.settle(TAP_WAIT);
-                    if let KeyMatch::Fire(id) = run.views.key_match(stroke) {
-                        run.control.dispatch_event(
+                    let m = stroke.modifiers;
+                    let plain = !(m.ctrl || m.alt || m.cmd || m.shift);
+                    match run.views.key_match(stroke) {
+                        KeyMatch::Fire(id) => run.control.dispatch_event(
                             ROOT,
                             EventKind::KeyCommand,
                             EventPayload::Value(PayloadValue::Number(f64::from(id))),
-                        );
+                        ),
+                        // Escape no binding takes goes back, as the
+                        // desktops' back key does, when an input does not
+                        // have the focus and there is something to go back
+                        // from.
+                        KeyMatch::None
+                            if stroke.key == Key::Escape
+                                && plain
+                                && !run.views.editing()
+                                && run.views.back_target() != Back::Nothing =>
+                        {
+                            run.go_back(true);
+                        }
+                        _ => {}
+                    }
+                }
+                "back" => {
+                    run.settle(TAP_WAIT);
+                    if !run.go_back(true) {
+                        return failed("nothing to go back from".into(), &run);
                     }
                 }
                 "type" | "key" => {
@@ -2136,5 +2365,128 @@ mod tests {
         });
         assert_eq!(views.texts(), ["Row 1"]);
         assert_eq!(views.find("text:Row 1"), Some(4));
+    }
+
+    fn listens(id: NodeId, kinds: &[EventKind]) -> MountItem {
+        let mut events = EventMask::default();
+        for &kind in kinds {
+            events.set(kind, true);
+        }
+        MountItem::Events { id, events }
+    }
+
+    /// The views and kinds of the events a back reports.
+    fn back(views: &mut Views, ask: bool) -> Option<Vec<(NodeId, EventKind)>> {
+        let events = views.back(ask)?;
+        Some(events.into_iter().map(|(id, kind, _)| (id, kind)).collect())
+    }
+
+    #[test]
+    fn a_back_pops_the_top_screen_asks_one_that_prevents_it_and_closes_modals() {
+        let mut views = Views::default();
+        views.apply(&MountBatch {
+            items: vec![
+                create(2, ViewKind::Stack),
+                create(4, ViewKind::Screen),
+                create(6, ViewKind::Text),
+                create(8, ViewKind::Screen),
+                create(10, ViewKind::Text),
+                insert(ROOT, 2),
+                insert(2, 4),
+                insert(4, 6),
+                insert(2, 8),
+                insert(8, 10),
+                text(6, "Home"),
+                text(10, "Details"),
+                listens(8, &[EventKind::BackRequest]),
+            ],
+        });
+        // The top screen hears the back and is popped: the one below shows.
+        assert_eq!(views.back_target(), Back::Pop(8));
+        assert_eq!(
+            back(&mut views, true),
+            Some(vec![(8, EventKind::BackRequest), (8, EventKind::Dismiss)])
+        );
+        assert_eq!(views.texts(), ["Home"]);
+        // One screen left: nothing to go back from.
+        assert_eq!(back(&mut views, true), None);
+        // The app removes the popped screen and pushes one that prevents
+        // going back: it is only asked.
+        views.apply(&MountBatch {
+            items: vec![
+                MountItem::Remove { id: 8 },
+                create(12, ViewKind::Screen),
+                MountItem::ScreenConfig {
+                    id: 12,
+                    config: Box::new(nsh_core::ScreenConfig {
+                        prevent_back: true,
+                        ..Default::default()
+                    }),
+                },
+                insert(2, 12),
+            ],
+        });
+        assert_eq!(
+            back(&mut views, true),
+            Some(vec![(12, EventKind::BackRequest)])
+        );
+        assert_eq!(views.back_target(), Back::Ask(12));
+
+        // A modal over it whose stack cannot go back: it is asked to close,
+        // and closes when the user may close it.
+        views.apply(&MountBatch {
+            items: vec![
+                create(14, ViewKind::Modal),
+                create(16, ViewKind::Text),
+                insert(ROOT, 14),
+                insert(14, 16),
+                text(16, "Sheet"),
+            ],
+        });
+        assert_eq!(
+            back(&mut views, true),
+            Some(vec![(14, EventKind::RequestClose)])
+        );
+        assert!(views.shows("Sheet"));
+        views.apply(&MountBatch {
+            items: vec![MountItem::ModalConfig {
+                id: 14,
+                config: nsh_core::ModalConfig {
+                    close_on_escape: true,
+                    ..Default::default()
+                },
+            }],
+        });
+        assert_eq!(
+            back(&mut views, true),
+            Some(vec![
+                (14, EventKind::RequestClose),
+                (14, EventKind::Dismiss)
+            ])
+        );
+        assert!(!views.shows("Sheet"));
+        assert_eq!(views.back_target(), Back::Ask(12));
+
+        // The root listens to the back button (an overlay, `BackHandler`):
+        // it hears a back first, and what none takes comes back as the
+        // app's own back, which goes back without asking.
+        views.apply(&MountBatch {
+            items: vec![listens(ROOT, &[EventKind::BackPress])],
+        });
+        assert_eq!(
+            back(&mut views, true),
+            Some(vec![(ROOT, EventKind::BackPress)])
+        );
+        views.apply(&MountBatch {
+            items: vec![MountItem::Command {
+                id: ROOT,
+                command: Command::Back,
+            }],
+        });
+        assert!(std::mem::take(&mut views.back_asked));
+        assert_eq!(
+            back(&mut views, false),
+            Some(vec![(12, EventKind::BackRequest)])
+        );
     }
 }
